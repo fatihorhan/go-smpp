@@ -5,34 +5,37 @@
 package pdutext
 
 import (
-    "golang.org/x/text/transform"
-    "github.com/fatihorhan/go-smpp/smpp/encoding"
+	"github.com/fatihorhan/go-smpp/smpp/encoding"
+	"golang.org/x/text/transform"
 )
 
 // GSM 7-bit (packed)
-type GSM7Packed []byte
+type GSM7Packed struct {
+	bytes []byte
+	nli   encoding.NLI
+}
 
 // Type implements the Codec interface.
 func (s GSM7Packed) Type() DataCoding {
-   return DefaultType
+	return DefaultType
 }
 
 // Encode to GSM 7-bit (packed)
 func (s GSM7Packed) Encode() []byte {
-    e := encoding.GSM7(true).NewEncoder()
-    es, _, err := transform.Bytes(e, s)
-    if err != nil {
-        return s
-    }
-    return es
+	e := encoding.GSM7(true, s.nli).NewEncoder()
+	es, _, err := transform.Bytes(e, s.bytes)
+	if err != nil {
+		return s.bytes
+	}
+	return es
 }
 
 // Decode from GSM 7-bit (packed)
 func (s GSM7Packed) Decode() []byte {
-    e := encoding.GSM7(true).NewDecoder()
-    es, _, err := transform.Bytes(e, s)
-    if err != nil {
-        return s
-    }
-    return es
+	e := encoding.GSM7(true, s.nli).NewDecoder()
+	es, _, err := transform.Bytes(e, s.bytes)
+	if err != nil {
+		return s.bytes
+	}
+	return es
 }

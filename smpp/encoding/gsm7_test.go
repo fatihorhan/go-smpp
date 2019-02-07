@@ -109,24 +109,6 @@ func TestGSM7EncodingString(t *testing.T) {
 	}
 }
 
-func TestValidateGSM7String(t *testing.T) {
-	for index, row := range validationStringTests {
-		actual := ValidateGSM7String(row.Text)
-		if !reflect.DeepEqual(actual, row.Expected) {
-			t.Fatalf("%2d: actual did not equal expected.\nactual: %s\nexpect: %s", index, string(actual), string(row.Expected))
-		}
-	}
-}
-
-func TestValidateGSM7Buffer(t *testing.T) {
-	for index, row := range validationBufferTests {
-		actual := ValidateGSM7Buffer(row.Buffer)
-		if !reflect.DeepEqual(actual, row.Expected) {
-			t.Fatalf("%2d: actual did not equal expected.\nactual: %s\nexpect: %s", index, hex.EncodeToString(actual), hex.EncodeToString(row.Expected))
-		}
-	}
-}
-
 func TestPackedEncoder(t *testing.T) {
 	encoder := GSM7(true).NewEncoder()
 	for index, row := range packedTests {

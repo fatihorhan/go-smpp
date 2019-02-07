@@ -9,12 +9,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/fatihorhan/go-smpp/smpp/encoding"
 	"github.com/fatihorhan/go-smpp/smpp/pdu"
 	"github.com/fatihorhan/go-smpp/smpp/pdu/pdufield"
 	"github.com/fatihorhan/go-smpp/smpp/pdu/pdutext"
@@ -43,7 +43,7 @@ type Transmitter struct {
 	RateLimiter        RateLimiter   // Rate limiter, optional.
 	WindowSize         uint
 	rMutex             sync.Mutex
-	r                  *rand.Rand
+	lastMessageRefNum  byte
 
 	cl struct {
 		sync.Mutex
@@ -67,7 +67,6 @@ type tx struct {
 // Any commands (e.g. Submit) attempted on a dead connection will
 // return ErrNotConnected.
 func (t *Transmitter) Bind() <-chan ConnStatus {
-	t.r = rand.New(rand.NewSource(time.Now().UnixNano()))
 	t.cl.Lock()
 	defer t.cl.Unlock()
 	if t.cl.client != nil {
@@ -182,7 +181,7 @@ type ShortMessage struct {
 	Register pdufield.DeliverySetting
 
 	// Other fields, normally optional.
-	TLVFields			 pdutlv.Fields
+	TLVFields            pdutlv.Fields
 	ServiceType          string
 	SourceAddrTON        uint8
 	SourceAddrNPI        uint8
@@ -324,47 +323,80 @@ func (t *Transmitter) Submit(sm *ShortMessage) (*ShortMessage, error) {
 	return t.submitMsg(sm, p, uint8(sm.Text.Type()))
 }
 
+func (t *Transmitter) nextMessageRefNum() byte {
+	t.rMutex.Lock()
+
+	// byte values cycle to 0 when overflowed, so we can have 255 message reference numbers in flight
+	// considering MRNs only used when submitting long messages, I think it should be enough
+	t.lastMessageRefNum++
+	if t.lastMessageRefNum == 0 {
+		t.lastMessageRefNum++
+	}
+
+	nmrn := t.lastMessageRefNum
+	t.rMutex.Unlock()
+
+	return nmrn
+}
+
 // SubmitLongMsg sends a long message (more than 140 bytes)
 // and returns and updates the given sm with the response status.
 // It returns the same sm object.
 func (t *Transmitter) SubmitLongMsg(sm *ShortMessage) ([]ShortMessage, error) {
-	maxLen := 133 // 140-7 (UDH with 2 byte reference number)
+	nli := encoding.NliNone
+
+	maxLen := 134 // 140-6 (UDH with 1 byte reference number)
 	switch sm.Text.(type) {
 	case pdutext.GSM7:
-		maxLen = 152 // to avoid an escape character being split between payloads
+		nli = sm.Text.(pdutext.GSM7).Nli()
+		maxLen = 153
+		if nli != encoding.NliNone {
+			maxLen = 149 // 3 byte is needed for NLI, 1 byte is wasted because of 8bit->7bit conversion
+		}
 		break
 	case pdutext.GSM7Packed:
-		maxLen = 132 // to avoid an escape character being split between payloads
+		maxLen = 134
 		break
 	case pdutext.UCS2:
-		maxLen = 132 // to avoid a character being split between payloads
+		maxLen = 134
 		break
 	}
-	rawMsg := sm.Text.Encode()
-	countParts := int((len(rawMsg)-1)/maxLen) + 1
 
+	rawMsg := sm.Text.Encode()
+	messageRefNum := t.nextMessageRefNum()
+
+	countParts := int((len(rawMsg)-1)/maxLen) + 1
 	parts := make([]ShortMessage, 0, countParts)
 
-	t.rMutex.Lock()
-	rn := uint16(t.r.Intn(0xFFFF))
-	t.rMutex.Unlock()
-	UDHHeader := make([]byte, 7)
-	UDHHeader[0] = 0x06              // length of user data header
-	UDHHeader[1] = 0x08              // information element identifier, CSMS 16 bit reference number
-	UDHHeader[2] = 0x04              // length of remaining header
-	UDHHeader[3] = uint8(rn >> 8)    // most significant byte of the reference number
-	UDHHeader[4] = uint8(rn)         // least significant byte of the reference number
-	UDHHeader[5] = uint8(countParts) // total number of message parts
+	udhHeaderLength := 6
+	if nli != encoding.NliNone {
+		udhHeaderLength = 9
+	}
+	UDHHeader := make([]byte, udhHeaderLength)
+	UDHHeader[0] = byte(udhHeaderLength - 1)
+	UDHHeader[1] = 0x00 // information element identifier, CSMS 8 bit reference number
+	UDHHeader[2] = 0x03 // length of remaining header
+	UDHHeader[3] = messageRefNum
+	UDHHeader[4] = uint8(countParts) // total number of message parts
+
+	if nli != encoding.NliNone {
+		UDHHeader[6] = 0x25      // National Language Locking Shift
+		UDHHeader[7] = 0x01      // Length of NLI value
+		UDHHeader[8] = byte(nli) // Language
+	}
+
 	for i := 0; i < countParts; i++ {
-		UDHHeader[6] = uint8(i + 1) // current message part
+		UDHHeader[5] = uint8(i + 1) // current message part
 		p := pdu.NewSubmitSM(sm.TLVFields)
 		f := p.Fields()
 		f.Set(pdufield.SourceAddr, sm.Src)
 		f.Set(pdufield.DestinationAddr, sm.Dst)
 		if i != countParts-1 {
 			f.Set(pdufield.ShortMessage, pdutext.Raw(append(UDHHeader, rawMsg[i*maxLen:(i+1)*maxLen]...)))
+			p.TLVFields().Set(pdutlv.TagMoreMessagesToSend, 0x01)
 		} else {
 			f.Set(pdufield.ShortMessage, pdutext.Raw(append(UDHHeader, rawMsg[i*maxLen:]...)))
+			p.TLVFields().Set(pdutlv.TagMoreMessagesToSend, 0x00)
 		}
 		f.Set(pdufield.RegisteredDelivery, uint8(sm.Register))
 		if sm.Validity != time.Duration(0) {
@@ -375,7 +407,7 @@ func (t *Transmitter) SubmitLongMsg(sm *ShortMessage) ([]ShortMessage, error) {
 		f.Set(pdufield.SourceAddrNPI, sm.SourceAddrNPI)
 		f.Set(pdufield.DestAddrTON, sm.DestAddrTON)
 		f.Set(pdufield.DestAddrNPI, sm.DestAddrNPI)
-		f.Set(pdufield.ESMClass, 0x40)
+		f.Set(pdufield.ESMClass, sm.ESMClass|0x40)
 		f.Set(pdufield.ProtocolID, sm.ProtocolID)
 		f.Set(pdufield.PriorityFlag, sm.PriorityFlag)
 		f.Set(pdufield.ScheduleDeliveryTime, sm.ScheduleDeliveryTime)
@@ -407,10 +439,35 @@ func (t *Transmitter) SubmitLongMsg(sm *ShortMessage) ([]ShortMessage, error) {
 }
 
 func (t *Transmitter) submitMsg(sm *ShortMessage, p pdu.Body, dataCoding uint8) (*ShortMessage, error) {
+
+	text := sm.Text
+	nli := encoding.NliNone
+
 	f := p.Fields()
+
+	if gsmtext, converted := text.(pdutext.GSM7); converted {
+		nli = gsmtext.Nli()
+	}
+
+	if nli == encoding.NliNone {
+		f.Set(pdufield.ESMClass, sm.ESMClass)
+		f.Set(pdufield.ShortMessage, sm.Text)
+	} else {
+		f.Set(pdufield.ESMClass, sm.ESMClass|0x40)
+		const nliHeaderLength byte = 0x03
+		rawMsg := sm.Text.Encode()
+		udhHeader := []byte{
+			0x03,      // length of UDH Header
+			0x25,      // Language Shift
+			0x01,      // Header length
+			byte(nli), // Language
+		}
+		rawMsg = append(udhHeader, rawMsg...)
+		f.Set(pdufield.ShortMessage, pdutext.Raw(rawMsg))
+	}
+
 	f.Set(pdufield.SourceAddr, sm.Src)
 	f.Set(pdufield.DestinationAddr, sm.Dst)
-	f.Set(pdufield.ShortMessage, sm.Text)
 	f.Set(pdufield.RegisteredDelivery, uint8(sm.Register))
 	// Check if the message has validity set.
 	if sm.Validity != time.Duration(0) {
@@ -421,7 +478,6 @@ func (t *Transmitter) submitMsg(sm *ShortMessage, p pdu.Body, dataCoding uint8) 
 	f.Set(pdufield.SourceAddrNPI, sm.SourceAddrNPI)
 	f.Set(pdufield.DestAddrTON, sm.DestAddrTON)
 	f.Set(pdufield.DestAddrNPI, sm.DestAddrNPI)
-	f.Set(pdufield.ESMClass, sm.ESMClass)
 	f.Set(pdufield.ProtocolID, sm.ProtocolID)
 	f.Set(pdufield.PriorityFlag, sm.PriorityFlag)
 	f.Set(pdufield.ScheduleDeliveryTime, sm.ScheduleDeliveryTime)
